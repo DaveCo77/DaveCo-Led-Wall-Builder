@@ -1,8 +1,8 @@
 import { initializeApp } from "firebase/app";
+import { getAuth } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
 
-// --- PASTE YOUR FIREBASE CONFIG HERE ---
-// (Go to Firebase Console -> Project Settings -> General -> Scroll down to SDK Setup)
+
 const firebaseConfig = {
   apiKey: "AIzaSyBxQd9n0tz2gsKZQZIBq_qqpqPcdcH5HCM",
   authDomain: "led-build-pro.firebaseapp.com",
@@ -13,7 +13,9 @@ const firebaseConfig = {
   measurementId: "G-BYQTTDQSBH"
 };
 
+// Initialize Firebase
 const app = initializeApp(firebaseConfig);
-const db = getFirestore(app);
 
-export { db };
+// Export the Auth and Database tools so your Vue app can use them
+export const auth = getAuth(app);
+export const db = getFirestore(app);
