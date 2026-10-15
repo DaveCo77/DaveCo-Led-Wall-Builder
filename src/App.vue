@@ -3,7 +3,7 @@ import { reactive, computed, ref, watch, nextTick, onMounted, onBeforeUnmount } 
 import html2canvas from 'html2canvas';
 import jsPDF from 'jspdf';
 
-// Three.js loaded via ESM CDN so you don't even need to edit package.json!
+// Three.js via ESM CDN (zero package.json changes needed)
 import * as THREE from 'https://esm.sh/three@0.160.0';
 import { OrbitControls } from 'https://esm.sh/three@0.160.0/examples/jsm/controls/OrbitControls.js';
 
@@ -67,29 +67,31 @@ const handleLogout = async () => {
 // --- APP STATE ---
 const isDarkMode = ref(true);
 const viewMode = ref('3d'); // '3d' | 'visualizer' | 'power' | 'data'
-const flowDirection = ref('row_lr'); // 'row_lr' (Mate's Crew-Safe mode) | 'vertical' | 'horizontal'
+const supportType = ref('ground'); // 'ground' (Stacking System) | 'flown' (Rigged/Flown)
+const flowDirection = ref('row_lr'); // 'row_lr' | 'vertical' | 'horizontal'
 const logoUrl = ref(null);
 const logoBgColor = ref('#090d16');
 const pitchOverlayText = ref('');
 let loadedLogoImg = null;
 
-// 3D Specific State
-const curveAngle = ref(2.0);
-const trimHeight = ref(1.0);
+// 3D Stage State
+const curveAngle = ref(0);
+const trimHeight = ref(1.2); // Used when supportType === 'flown'
 const showRearSnake3D = ref(true);
 const showScaleHuman3D = ref(true);
-const removedTiles = reactive(new Set()); // Stores "col,row" keys for islands
+const removedTiles = reactive(new Set());
 
+// Defaults set to match your Excel sheet (500x500mm, 2.6mm pitch, 8.2kg, 10 per 10A, 16 per data port)
 const panel = reactive({
-  manufacturer: 'ROE',
-  model: 'Black Pearl 2',
+  manufacturer: 'ROE / Unilumin',
+  model: '500x500 Series',
   width_mm: 500,
   height_mm: 500,
-  pitch: 2.8,
-  weight_kg: 9.4,
+  pitch: 2.6,
+  weight_kg: 8.2,
   wall_width_tiles: 12,
   wall_height_tiles: 6,
-  max_power_circuit: 6,
+  max_power_circuit: 10,
   max_data_port: 16,
   power_reverse: false,
   data_reverse: false
@@ -122,7 +124,6 @@ const applyIslandPreset = (preset) => {
 };
 
 // --- CORE PATCHING & TOPOLOGY ENGINE ---
-// Builds exact ordered chains for both Power and Data (supporting Row L->R, Vert Snake, Horiz Snake, and Islands)
 const buildPatchChains = (mode) => {
   const w = panel.wall_width_tiles;
   const h = panel.wall_height_tiles;
@@ -131,7 +132,6 @@ const buildPatchChains = (mode) => {
   const chains = [];
 
   if (flowDirection.value === 'row_lr') {
-    // Mate's Crew-Proof Mode: Each row starts a fresh port/circuit so daisy-chains strictly run horizontally!
     for (let r = 0; r < h; r++) {
       const colsOrder = [...Array(w).keys()];
       if (isReverse) colsOrder.reverse();
@@ -163,7 +163,6 @@ const buildPatchChains = (mode) => {
       chains.push(orderedNodes.slice(i, i + limit));
     }
   } else {
-    // Horizontal snake
     const orderedNodes = [];
     for (let r = 0; r < h; r++) {
       let colsOrder = [...Array(w).keys()];
@@ -185,7 +184,6 @@ const buildPatchChains = (mode) => {
 const powerChains = computed(() => buildPatchChains('power'));
 const dataChains = computed(() => buildPatchChains('data'));
 
-// Lookup table for fast 2D tile rendering
 const patchMapByMode = computed(() => {
   const mode = viewMode.value === 'power' ? 'power' : 'data';
   const chains = mode === 'power' ? powerChains.value : dataChains.value;
@@ -218,30 +216,99 @@ const patchMapByMode = computed(() => {
   return lookup;
 });
 
+// --- EXCEL RIGGING, STACKING & POWER CALCULATOR ---
 const stats = computed(() => {
-  const raw_total = panel.wall_width_tiles * panel.wall_height_tiles;
+  const w = panel.wall_width_tiles;
+  const h = panel.wall_height_tiles;
+  const raw_total = w * h;
   const total_tiles = Math.max(0, raw_total - removedTiles.size);
-  const width_m = (panel.wall_width_tiles * panel.width_mm / 1000).toFixed(2);
-  const height_m = (panel.wall_height_tiles * panel.height_mm / 1000).toFixed(2);
+  const width_m_num = (w * panel.width_mm) / 1000;
+  const height_m_num = (h * panel.height_mm) / 1000;
+  const width_m = width_m_num.toFixed(2);
+  const height_m = height_m_num.toFixed(2);
+
   const tile_res_w = Math.round(panel.width_mm / panel.pitch);
   const tile_res_h = Math.round(panel.height_mm / panel.pitch);
-  const res_w = tile_res_w * panel.wall_width_tiles;
-  const res_h = tile_res_h * panel.wall_height_tiles;
+  const res_w = tile_res_w * w;
+  const res_h = tile_res_h * h;
+  const td_warning_w = res_w > 3840;
+  const td_warning_h = res_h > 2160;
 
   const total_power_circuits = powerChains.value.length;
   const total_data_ports = dataChains.value.length;
-  const total_weight = (total_tiles * panel.weight_kg).toFixed(0);
-  const wallAspectRatio = (panel.wall_width_tiles * panel.width_mm) / (panel.wall_height_tiles * panel.height_mm);
+  const wallAspectRatio = (w * panel.width_mm) / (h * panel.height_mm);
 
+  // Cabling & Power from Excel Sheet
   const power_input_cables = total_power_circuits;
   const data_input_cables = total_data_ports;
   const power_link_cables = Math.max(0, total_tiles - power_input_cables);
   const data_link_cables = Math.max(0, total_tiles - data_input_cables);
+  const total_amps = total_tiles * 1.0; // 1A per panel
+  const three_phase_distros = Math.ceil(total_power_circuits / 12); // 12x 10A outlets per 3Ø rack
+  const cable_weight_kg = +(total_tiles * 0.4).toFixed(2);
+  const spare_panels = Math.round(total_tiles * 0.10);
+  const vx1000_processors = Math.max(1, Math.ceil(total_data_ports / 10));
+
+  // Panel & Rigging Hardware Weights (Exact Excel Formulas)
+  const panels_weight_kg = +(total_tiles * panel.weight_kg).toFixed(2);
+  const bracket_qty = w;
+  const bracket_weight_kg = +(bracket_qty * 4.8).toFixed(2);
+
+  // Groundstack Hardware
+  const base_leg_qty = w;
+  const base_leg_weight_kg = +(base_leg_qty * 4.0).toFixed(2);
+
+  const ladder_truss_per_col = Math.ceil(height_m_num);
+  const ladder_truss_qty = w * ladder_truss_per_col;
+  const ladder_truss_weight_kg = +(ladder_truss_qty * 3.3).toFixed(2);
+
+  const beam_coupler_qty = Math.max(0, (h - 1) * w);
+  const beam_coupler_weight_kg = +(beam_coupler_qty * 1.0).toFixed(2);
+
+  const crossbar_rows = Math.max(2, Math.ceil(height_m_num));
+  const crossbar_qty = Math.max(0, crossbar_rows * (w - 1));
+  const crossbar_weight_kg = +(crossbar_qty * 1.1).toFixed(2);
+
+  const total_ground_stack_weight = +(
+    panels_weight_kg +
+    bracket_weight_kg +
+    base_leg_weight_kg +
+    ladder_truss_weight_kg +
+    beam_coupler_weight_kg +
+    crossbar_weight_kg
+  ).toFixed(2);
+
+  const ballast_weight_kg = +(panels_weight_kg / 1.5).toFixed(2);
+  const total_ground_with_ballast = +(total_ground_stack_weight + ballast_weight_kg).toFixed(2);
+
+  // Flown Hardware
+  const halfcoupler_shackle_qty = w;
+  const halfcoupler_shackle_weight_kg = +(halfcoupler_shackle_qty * 1.0).toFixed(2);
+  const total_flown_weight = +(
+    panels_weight_kg +
+    bracket_weight_kg +
+    halfcoupler_shackle_weight_kg +
+    cable_weight_kg
+  ).toFixed(2);
+
+  const active_total_weight = supportType.value === 'ground'
+    ? total_ground_with_ballast.toFixed(0)
+    : total_flown_weight.toFixed(0);
 
   return {
     raw_total, total_tiles, width_m, height_m, res_w, res_h, tile_res_w, tile_res_h,
-    total_power_circuits, total_data_ports, total_weight, wallAspectRatio,
-    power_input_cables, data_input_cables, power_link_cables, data_link_cables
+    td_warning_w, td_warning_h,
+    total_power_circuits, total_data_ports, wallAspectRatio,
+    power_input_cables, data_input_cables, power_link_cables, data_link_cables,
+    total_amps, three_phase_distros, cable_weight_kg, spare_panels, vx1000_processors,
+    panels_weight_kg, bracket_qty, bracket_weight_kg,
+    base_leg_qty, base_leg_weight_kg,
+    ladder_truss_qty, ladder_truss_weight_kg,
+    beam_coupler_qty, beam_coupler_weight_kg,
+    crossbar_qty, crossbar_weight_kg,
+    total_ground_stack_weight, ballast_weight_kg, total_ground_with_ballast,
+    halfcoupler_shackle_qty, halfcoupler_shackle_weight_kg, total_flown_weight,
+    total_weight: active_total_weight
   };
 });
 
@@ -253,16 +320,9 @@ const getTileInfo = (n) => {
 
   if (removedTiles.has(key)) {
     return {
-      isRemoved: true,
-      col, row,
-      style: {
-        backgroundColor: 'transparent',
-        borderColor: 'rgba(150,150,150,0.2)',
-        borderStyle: 'dashed',
-        color: '#666'
-      },
-      label: 'VOID',
-      arrow: ''
+      isRemoved: true, col, row,
+      style: { backgroundColor: 'transparent', borderColor: 'rgba(150,150,150,0.2)', borderStyle: 'dashed', color: '#666' },
+      label: 'VOID', arrow: ''
     };
   }
 
@@ -270,8 +330,7 @@ const getTileInfo = (n) => {
   if (!info) return { isRemoved: false, col, row, style: {}, label: '', arrow: '' };
 
   return {
-    isRemoved: false,
-    col, row,
+    isRemoved: false, col, row,
     isStart: info.isStart,
     style: {
       backgroundColor: info.color + '33',
@@ -301,7 +360,7 @@ const handleLogoUpload = (event) => {
 };
 
 // ============================================================================
-// THREE.JS 3D SPATIAL ENGINE (ViewMode === '3d')
+// THREE.JS 3D SPATIAL ENGINE (Includes 3D Ground-Stack Ladder Truss System!)
 // ============================================================================
 const threeContainer = ref(null);
 let scene, camera, renderer, controls, raycaster, mouse, animId;
@@ -314,7 +373,6 @@ const updateRasterCanvasTexture = () => {
   rasterCanvas.height = 900;
   const ctx = rasterCanvas.getContext('2d');
 
-  // Background fill
   ctx.fillStyle = logoBgColor.value || '#090d16';
   ctx.fillRect(0, 0, 1600, 900);
 
@@ -323,7 +381,6 @@ const updateRasterCanvasTexture = () => {
   const cellW = 1600 / w;
   const cellH = 900 / h;
 
-  // Draw subtle cabinet grid & coordinates
   for (let c = 0; c < w; c++) {
     for (let r = 0; r < h; r++) {
       if (!logoUrl.value) {
@@ -340,7 +397,6 @@ const updateRasterCanvasTexture = () => {
     }
   }
 
-  // If user uploaded a Logo / Screen Content, render it prominently
   if (loadedLogoImg) {
     const pad = 80;
     const availW = 1600 - pad * 2;
@@ -354,7 +410,6 @@ const updateRasterCanvasTexture = () => {
     }
     ctx.drawImage(loadedLogoImg, (1600 - drawW) / 2, (900 - drawH) / 2, drawW, drawH);
   } else {
-    // Default Calibration Sync Lines & Circle
     ctx.strokeStyle = '#f43f5e';
     ctx.lineWidth = 4;
     ctx.beginPath();
@@ -369,21 +424,23 @@ const updateRasterCanvasTexture = () => {
     ctx.stroke();
 
     ctx.fillStyle = 'rgba(9, 13, 22, 0.9)';
-    ctx.fillRect(480, 360, 640, 180);
+    ctx.fillRect(460, 355, 680, 190);
     ctx.strokeStyle = '#22d3ee';
-    ctx.strokeRect(480, 360, 640, 180);
+    ctx.strokeRect(460, 355, 680, 190);
 
     ctx.fillStyle = '#ffffff';
     ctx.font = 'bold 34px sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText(`${panel.manufacturer} ${panel.model}`.toUpperCase(), 800, 430);
+    ctx.fillText(`${panel.manufacturer} ${panel.model}`.toUpperCase(), 800, 425);
     ctx.fillStyle = '#38bdf8';
-    ctx.font = 'bold 26px monospace';
-    ctx.fillText(`${stats.value.res_w} × ${stats.value.res_h} px (${stats.value.width_m}m × ${stats.value.height_m}m)`, 800, 485);
+    ctx.font = 'bold 25px monospace';
+    ctx.fillText(`${stats.value.res_w} × ${stats.value.res_h} px (${stats.value.width_m}m × ${stats.value.height_m}m)`, 800, 475);
+    ctx.fillStyle = '#a3e635';
+    ctx.font = 'bold 20px monospace';
+    ctx.fillText(supportType.value === 'ground' ? 'SYSTEM: GROUND STACKED LADDER TRUSS' : 'SYSTEM: FLOWN OVERHEAD RIG', 800, 515);
     ctx.textAlign = 'left';
   }
 
-  // Optional Pitch Overlay Badge on 3D Wall
   if (pitchOverlayText.value) {
     ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
     ctx.fillRect(1180, 810, 390, 65);
@@ -404,7 +461,7 @@ const updateRasterCanvasTexture = () => {
   }
 };
 
-// Articulated 1.80m Stage Tech Mannequin with Hardhat & Hi-Vis Vest
+// Articulated 1.80m Stage Tech Mannequin
 const createArticulatedStageTech = () => {
   const human = new THREE.Group();
   const denimMat = new THREE.MeshStandardMaterial({ color: 0x1e3a8a, roughness: 0.7 });
@@ -459,6 +516,78 @@ const createArticulatedStageTech = () => {
   return human;
 };
 
+// Builds a single column's 3D Ground-Stack Ladder Truss & 850mm Base Leg (matching your product photo!)
+const createGroundStackTowerMesh = (wallHeightM, cabW) => {
+  const tower = new THREE.Group();
+  const blackSteelMat = new THREE.MeshStandardMaterial({ color: 0x151922, metalness: 0.75, roughness: 0.35 });
+  const ballastMat = new THREE.MeshStandardMaterial({ color: 0x334155, metalness: 0.5, roughness: 0.6 });
+
+  // 1. 850mm Base Leg (Rectangular frame extending 0.85m behind the screen)
+  const baseDepth = 0.85;
+  const baseWidth = 0.18;
+  const baseZCenter = -0.05 - baseDepth / 2;
+
+  const leftSkid = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.05, baseDepth), blackSteelMat);
+  leftSkid.position.set(-baseWidth / 2, 0.06, baseZCenter);
+  const rightSkid = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.05, baseDepth), blackSteelMat);
+  rightSkid.position.set(baseWidth / 2, 0.06, baseZCenter);
+
+  const frontBumperPlate = new THREE.Mesh(new THREE.BoxGeometry(cabW * 0.98, 0.08, 0.12), blackSteelMat);
+  frontBumperPlate.position.set(0, 0.08, 0);
+
+  const rearTie = new THREE.Mesh(new THREE.BoxGeometry(baseWidth + 0.04, 0.05, 0.05), blackSteelMat);
+  rearTie.position.set(0, 0.06, -0.05 - baseDepth + 0.025);
+
+  // Leveling screw jacks under base leg
+  [-0.08, -0.82].forEach(zPos => {
+    [-baseWidth / 2, baseWidth / 2].forEach(xPos => {
+      const foot = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.035, 0.04, 12), blackSteelMat);
+      foot.position.set(xPos, 0.02, zPos);
+      tower.add(foot);
+    });
+  });
+
+  // Ballast block sitting on rear of 850mm base leg
+  const ballastBlock = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.14, 0.32), ballastMat);
+  ballastBlock.position.set(0, 0.15, -0.62);
+
+  tower.add(leftSkid, rightSkid, frontBumperPlate, rearTie, ballastBlock);
+
+  // 2. Vertical 1m Ladder Truss Mast (2 vertical rails + horizontal ladder rungs)
+  const mastH = Math.max(1.0, wallHeightM);
+  const ladderZ = -0.34;
+  const railSpacing = 0.14;
+
+  [-railSpacing / 2, railSpacing / 2].forEach(xPos => {
+    const rail = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.018, mastH, 12), blackSteelMat);
+    rail.position.set(xPos, 0.08 + mastH / 2, ladderZ);
+    tower.add(rail);
+  });
+
+  // Rungs every 250mm up the ladder truss
+  const numRungs = Math.floor(mastH / 0.25);
+  for (let i = 1; i <= numRungs; i++) {
+    const rungY = 0.08 + i * 0.25;
+    const rung = new THREE.Mesh(new THREE.CylinderGeometry(0.01, 0.01, railSpacing, 8), blackSteelMat);
+    rung.rotation.z = Math.PI / 2;
+    rung.position.set(0, rungY, ladderZ);
+    tower.add(rung);
+  }
+
+  // 3. Locking Beam Couplers (Standoff arms + perforated square mounting plates connecting ladder to LED panels)
+  const couplerHeights = [mastH * 0.38, mastH * 0.82];
+  couplerHeights.forEach(cY => {
+    const armLen = Math.abs(ladderZ) - 0.04;
+    const arm = new THREE.Mesh(new THREE.BoxGeometry(0.035, 0.035, armLen), blackSteelMat);
+    arm.position.set(0, 0.08 + cY, ladderZ / 2 - 0.02);
+    const plate = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.12, 0.012), blackSteelMat);
+    plate.position.set(0, 0.08 + cY, -0.048);
+    tower.add(arm, plate);
+  });
+
+  return tower;
+};
+
 const build3DWall = () => {
   if (!scene) return;
   updateRasterCanvasTexture();
@@ -470,8 +599,11 @@ const build3DWall = () => {
   const h = panel.wall_height_tiles;
   const cabW = panel.width_mm / 1000;
   const cabH = panel.height_mm / 1000;
+  const wallHeightM = h * cabH;
 
-  // Forward kinematics for curved / faceted columns
+  // Ground stack sits on the 120mm stacking base; Flown uses trimHeight slider
+  const activeTrimY = supportType.value === 'ground' ? 0.12 : trimHeight.value;
+
   const transforms = [];
   let curX = 0, curZ = 0, curAngle = 0;
   const radStep = THREE.MathUtils.degToRad(curveAngle.value);
@@ -497,7 +629,7 @@ const build3DWall = () => {
       const key = `${c},${r}`;
       if (removedTiles.has(key)) continue;
 
-      const posY = trimHeight.value + (h - 1 - r + 0.5) * cabH;
+      const posY = activeTrimY + (h - 1 - r + 0.5) * cabH;
       const geo = new THREE.BoxGeometry(cabW * 0.985, cabH * 0.985, 0.08);
       const uvAttr = geo.attributes.uv;
       const uMin = c / w, uMax = (c + 1) / w;
@@ -523,27 +655,50 @@ const build3DWall = () => {
       rearCenters.set(key, new THREE.Vector3(colT.x, posY, colT.z).add(rearOffset));
     }
 
-    // Rigging Bumper Header & Hoists
-    const bumperY = trimHeight.value + h * cabH + 0.06;
-    const bumper = new THREE.Mesh(
-      new THREE.BoxGeometry(cabW * 0.98, 0.1, 0.12),
-      new THREE.MeshStandardMaterial({ color: 0x334155, metalness: 0.8, roughness: 0.3 })
-    );
-    bumper.position.set(colT.x, bumperY, colT.z);
-    bumper.rotation.y = colT.rotY;
-    wallGroup.add(bumper);
+    if (supportType.value === 'ground') {
+      // Render 3D Ground-Stack Ladder Truss & Base Leg behind column
+      const tower = createGroundStackTowerMesh(wallHeightM, cabW);
+      tower.position.set(colT.x, 0, colT.z);
+      tower.rotation.y = colT.rotY;
+      wallGroup.add(tower);
 
-    if (c % 4 === 0 || c === w - 1) {
-      const hoist = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.028, 0.028, 1.4),
-        new THREE.MeshBasicMaterial({ color: 0xf43f5e })
+      // 500mm Horizontal Crossbars linking adjacent towers
+      if (c < w - 1) {
+        const nextT = transforms[c + 1];
+        const p1 = new THREE.Vector3(colT.x, 0.08, colT.z).add(
+          new THREE.Vector3(0, 0, -0.34).applyAxisAngle(new THREE.Vector3(0, 1, 0), colT.rotY)
+        );
+        const p2 = new THREE.Vector3(nextT.x, 0.08, nextT.z).add(
+          new THREE.Vector3(0, 0, -0.34).applyAxisAngle(new THREE.Vector3(0, 1, 0), nextT.rotY)
+        );
+        const barPath = new THREE.LineCurve3(p1, p2);
+        const crossbarGeo = new THREE.TubeGeometry(barPath, 2, 0.016, 8, false);
+        const crossbarMat = new THREE.MeshStandardMaterial({ color: 0x151922, metalness: 0.8, roughness: 0.3 });
+        wallGroup.add(new THREE.Mesh(crossbarGeo, crossbarMat));
+      }
+    } else {
+      // Render Flown Overhead Rigging Bumper & Hoists
+      const bumperY = activeTrimY + wallHeightM + 0.06;
+      const bumper = new THREE.Mesh(
+        new THREE.BoxGeometry(cabW * 0.98, 0.1, 0.12),
+        new THREE.MeshStandardMaterial({ color: 0x334155, metalness: 0.8, roughness: 0.3 })
       );
-      hoist.position.set(colT.x, bumperY + 0.7, colT.z);
-      wallGroup.add(hoist);
+      bumper.position.set(colT.x, bumperY, colT.z);
+      bumper.rotation.y = colT.rotY;
+      wallGroup.add(bumper);
+
+      if (c % 4 === 0 || c === w - 1) {
+        const hoist = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.028, 0.028, 1.4),
+          new THREE.MeshBasicMaterial({ color: 0xf43f5e })
+        );
+        hoist.position.set(colT.x, bumperY + 0.7, colT.z);
+        wallGroup.add(hoist);
+      }
     }
   }
 
-  // Draw 3D Rear Data Splines matching the active Signal Flow mode
+  // Draw 3D Rear Data Splines
   if (showRearSnake3D.value) {
     dataChains.value.forEach((chain, idx) => {
       const pts = chain.map(n => rearCenters.get(n.key)).filter(Boolean);
@@ -579,10 +734,11 @@ const set3DCameraView = (side) => {
   if (!camera || !controls) return;
   const cabH = panel.height_mm / 1000;
   const cabW = panel.width_mm / 1000;
-  const targetY = trimHeight.value + (panel.wall_height_tiles * cabH) / 2;
+  const activeTrimY = supportType.value === 'ground' ? 0.12 : trimHeight.value;
+  const targetY = activeTrimY + (panel.wall_height_tiles * cabH) / 2;
   const dist = Math.max(5.5, panel.wall_width_tiles * cabW * 1.25);
   controls.target.set(0, targetY, 0);
-  camera.position.set(0, targetY + 0.4, side === 'front' ? dist : -dist);
+  camera.position.set(side === 'rear' ? 1.8 : 0, targetY + 0.4, side === 'front' ? dist : -dist);
   controls.update();
 };
 
@@ -593,10 +749,9 @@ const initThreeJS = () => {
   scene = new THREE.Scene();
   scene.background = new THREE.Color(isDarkMode.value ? 0x090d16 : 0xdde3ea);
 
-  camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 100);
-  camera.position.set(2.4, 2.8, 7.2);
+  camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 120);
+  camera.position.set(2.8, 2.5, 6.8);
 
-  // preserveDrawingBuffer: true is required so html2canvas / jsPDF can snapshot the 3D WebGL canvas!
   renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
   renderer.setSize(container.clientWidth, container.clientHeight);
   renderer.setPixelRatio(window.devicePixelRatio);
@@ -605,13 +760,16 @@ const initThreeJS = () => {
 
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
-  controls.target.set(0, 2.1, 0);
+  controls.target.set(0, 1.8, 0);
 
-  scene.add(new THREE.GridHelper(24, 48, 0x2a364f, 0x151d2e));
+  scene.add(new THREE.GridHelper(28, 56, 0x2a364f, 0x151d2e));
   scene.add(new THREE.AmbientLight(0xffffff, 0.95));
-  const dirLight = new THREE.DirectionalLight(0xffffff, 1.3);
+  const dirLight = new THREE.DirectionalLight(0xffffff, 1.35);
   dirLight.position.set(6, 12, 8);
   scene.add(dirLight);
+  const backLight = new THREE.DirectionalLight(0x90caf9, 0.8);
+  backLight.position.set(-5, 8, -10);
+  scene.add(backLight);
 
   raycaster = new THREE.Raycaster();
   mouse = new THREE.Vector2();
@@ -654,7 +812,7 @@ watch(
     () => panel.width_mm, () => panel.height_mm, () => panel.pitch,
     () => panel.manufacturer, () => panel.model,
     () => panel.max_data_port, () => panel.data_reverse,
-    flowDirection, curveAngle, trimHeight, showRearSnake3D, showScaleHuman3D,
+    supportType, flowDirection, curveAngle, trimHeight, showRearSnake3D, showScaleHuman3D,
     logoBgColor, pitchOverlayText, isDarkMode
   ],
   () => {
@@ -709,14 +867,15 @@ const exportSpecificPDF = async (mode) => {
   };
   addStat("Dimensions", `${stats.value.width_m}m (W) x ${stats.value.height_m}m (H)`);
   addStat("Total Resolution", `${stats.value.res_w}px x ${stats.value.res_h}px`);
-  addStat("Active Tiles", `${stats.value.total_tiles} panels`);
-  y += 5;
+  addStat("Rigging Mode", supportType.value === 'ground' ? 'Ground-Stacked' : 'Flown');
+  addStat("Total System Weight", `${stats.value.total_weight} kg`);
+  y += 4;
   if (mode === 'power') {
     doc.setTextColor(79, 195, 247);
-    doc.text(`10A Circuits: ${stats.value.total_power_circuits}`, x, y);
+    doc.text(`10A Circuits: ${stats.value.total_power_circuits} (${stats.value.three_phase_distros}x 3Ø) / ${stats.value.total_amps}A`, x, y);
   } else {
     doc.setTextColor(229, 115, 115);
-    doc.text(`Data Ports: ${stats.value.total_data_ports}`, x, y);
+    doc.text(`Data Ports: ${stats.value.total_data_ports} (${stats.value.vx1000_processors}x VX1000)`, x, y);
   }
 
   doc.save(`${title.replace(/\s+/g, '_')}.pdf`);
@@ -725,7 +884,6 @@ const exportSpecificPDF = async (mode) => {
 
 const exportPitchPDF = async () => {
   const originalMode = viewMode.value;
-  // If user is in 3D mode, snapshot the 3D Stage! Otherwise snapshot the 2D Pitch visualizer.
   if (viewMode.value !== '3d' && viewMode.value !== 'visualizer') {
     viewMode.value = '3d';
     await nextTick();
@@ -746,7 +904,7 @@ const exportPitchPDF = async () => {
     doc.setFillColor(15, 15, 18); doc.rect(0, 0, 297, 210, 'F');
     doc.setTextColor(255, 255, 255); doc.setFontSize(22); doc.text("LED Stage Concept", 15, 25);
     doc.setFontSize(11); doc.setTextColor(180, 180, 180);
-    doc.text(`Dimensions: ${stats.value.width_m}m x ${stats.value.height_m}m  |  Resolution: ${stats.value.res_w} x ${stats.value.res_h}  |  Curve: ${curveAngle.value}°`, 15, 34);
+    doc.text(`Dimensions: ${stats.value.width_m}m x ${stats.value.height_m}m  |  Resolution: ${stats.value.res_w} x ${stats.value.res_h}  |  Rigging: ${supportType.value.toUpperCase()}`, 15, 34);
 
     if (pitchOverlayText.value) {
       doc.setFontSize(14); doc.setTextColor(255, 255, 255);
@@ -765,33 +923,61 @@ const exportPitchPDF = async () => {
   }, 100);
 };
 
+// Updated Warehouse Pick List PDF — includes your full Excel Groundstack / Flown Hardware & Weights!
 const exportCableListPDF = () => {
   const doc = new jsPDF({ orientation: 'portrait' });
   if (isDarkMode.value) { doc.setFillColor(30, 30, 30); doc.rect(0, 0, 210, 297, 'F'); doc.setTextColor(255, 255, 255); }
   else { doc.setFillColor(255, 255, 255); doc.rect(0, 0, 210, 297, 'F'); doc.setTextColor(0, 0, 0); }
 
-  doc.setFontSize(24); doc.text("Warehouse Pick List", 20, 30);
-  doc.setFontSize(12); doc.setTextColor(150, 150, 150);
-  doc.text(`${panel.manufacturer} ${panel.model}`, 20, 40);
-  doc.text(`Generated: ${new Date().toLocaleDateString()}`, 20, 47);
-  doc.setDrawColor(100, 100, 100); doc.line(20, 55, 190, 55);
-  doc.setTextColor(isDarkMode.value ? 255 : 0); doc.setFontSize(16); doc.text("Wall Specifications", 20, 70);
-  doc.setFontSize(12);
-  doc.text(`Total Active Panels: ${stats.value.total_tiles}`, 25, 80);
-  doc.text(`Array Grid: ${panel.wall_width_tiles} W  x  ${panel.wall_height_tiles} H`, 25, 88);
-  doc.text(`Physical Size: ${stats.value.width_m}m  x  ${stats.value.height_m}m`, 25, 96);
-  doc.text(`Total Weight: ${stats.value.total_weight} kg`, 25, 104);
-  doc.setFontSize(16); doc.text("Cable Requirements", 20, 125);
-  doc.setFontSize(14); doc.setTextColor(isDarkMode.value ? 200 : 50); doc.text("Input Cables (Home Runs)", 25, 137);
-  doc.setFontSize(12); doc.setTextColor(isDarkMode.value ? 255 : 0);
-  doc.text(`[   ]  Power Inputs:  ${stats.value.power_input_cables}`, 30, 147);
-  doc.text(`[   ]  Data Inputs:   ${stats.value.data_input_cables}`, 30, 155);
-  doc.setFontSize(14); doc.setTextColor(isDarkMode.value ? 200 : 50); doc.text("Link Cables (Daisy Chain)", 25, 175);
-  doc.setFontSize(12); doc.setTextColor(isDarkMode.value ? 255 : 0);
-  doc.text(`[   ]  Power Links:   ${stats.value.power_link_cables}`, 30, 185);
-  doc.text(`[   ]  Data Links:    ${stats.value.data_link_cables}`, 30, 193);
-  doc.line(20, 215, 190, 215); doc.setFontSize(10); doc.setTextColor(150, 150, 150); doc.text("Notes:", 20, 225);
-  doc.save(`Pick_List.pdf`);
+  doc.setFontSize(22); doc.text("Warehouse Pick List & Rigging Spec", 18, 24);
+  doc.setFontSize(10); doc.setTextColor(150, 150, 150);
+  doc.text(`${panel.manufacturer} ${panel.model}  |  System: ${supportType.value === 'ground' ? 'GROUND STACKED' : 'FLOWN'}  |  ${new Date().toLocaleDateString()}`, 18, 32);
+  doc.setDrawColor(100, 100, 100); doc.line(18, 37, 192, 37);
+
+  let y = 47;
+  const line = (label, qty, weight = '') => {
+    doc.setFontSize(10);
+    doc.setTextColor(isDarkMode.value ? 230 : 20);
+    doc.text(label, 22, y);
+    if (qty !== '') doc.text(String(qty), 125, y);
+    if (weight !== '') doc.text(String(weight), 162, y);
+    y += 7;
+  };
+
+  doc.setFontSize(13); doc.setTextColor(41, 182, 246);
+  doc.text("1. LED Panels & Processors", 18, y); y += 8;
+  line(`[  ] Regular Panels (${panel.width_mm}x${panel.height_mm}mm)`, `${stats.value.total_tiles} pcs`, `${stats.value.panels_weight_kg} kg`);
+  line(`[  ] Spare Panels (10%)`, `${stats.value.spare_panels} pcs`, `-`);
+  line(`[  ] Novastar VX1000 Processors`, `${stats.value.vx1000_processors} pcs`, `-`);
+  line(`[  ] Hanging / Stacking Brackets`, `${stats.value.bracket_qty} pcs`, `${stats.value.bracket_weight_kg} kg`);
+
+  y += 4;
+  doc.setFontSize(13); doc.setTextColor(163, 230, 53);
+  if (supportType.value === 'ground') {
+    doc.text("2. Ground-Stacking Support System", 18, y); y += 8;
+    line(`[  ] 850mm Base Legs`, `${stats.value.base_leg_qty} pcs`, `${stats.value.base_leg_weight_kg} kg`);
+    line(`[  ] 1m Ladder Truss Sections`, `${stats.value.ladder_truss_qty} pcs`, `${stats.value.ladder_truss_weight_kg} kg`);
+    line(`[  ] Locking Beam Couplers`, `${stats.value.beam_coupler_qty} pcs`, `${stats.value.beam_coupler_weight_kg} kg`);
+    line(`[  ] 500mm Cross Bars`, `${stats.value.crossbar_qty} pcs`, `${stats.value.crossbar_weight_kg} kg`);
+    line(`Total Ground Stack Structure + Panels:`, ``, `${stats.value.total_ground_stack_weight} kg`);
+    line(`[  ] Required Counterweight / Ballast:`, ``, `${stats.value.ballast_weight_kg} kg`);
+    line(`TOTAL GROUND STACK WEIGHT w/ BALLAST:`, ``, `${stats.value.total_ground_with_ballast} kg`);
+  } else {
+    doc.text("2. Flown Rigging Hardware", 18, y); y += 8;
+    line(`[  ] Halfcoupler & Shackle Sets`, `${stats.value.halfcoupler_shackle_qty} pcs`, `${stats.value.halfcoupler_shackle_weight_kg} kg`);
+    line(`TOTAL FLOWN WEIGHT (incl. Cables):`, ``, `${stats.value.total_flown_weight} kg`);
+  }
+
+  y += 4;
+  doc.setFontSize(13); doc.setTextColor(255, 183, 77);
+  doc.text("3. Power & Signal Cabling", 18, y); y += 8;
+  line(`[  ] Signal Input Cables (Home Runs)`, `${stats.value.data_input_cables} pcs`, ``);
+  line(`[  ] Signal Link Cables (Cat6 Jumpers)`, `${stats.value.data_link_cables} pcs`, ``);
+  line(`[  ] Power Input Cables (10A Mains)`, `${stats.value.power_input_cables} pcs (${stats.value.three_phase_distros}x 3Ø)`, ``);
+  line(`[  ] Power Link Cables (True1 Jumpers)`, `${stats.value.power_link_cables} pcs`, ``);
+  line(`[  ] 4K HDMI / 12G SDI / 4K Fiber Loom`, `1 lot`, `${stats.value.cable_weight_kg} kg (All Cables)`);
+
+  doc.save(`Pick_List_${supportType.value.toUpperCase()}.pdf`);
 };
 
 const generatePixelMap = () => {
@@ -861,26 +1047,44 @@ const generatePixelMap = () => {
           <h2>WALL BUILDER</h2>
           <button @click="isDarkMode = !isDarkMode" class="theme-toggle">{{ isDarkMode ? '☀' : '☾' }}</button>
         </div>
-        <span class="version">PRO v4.0 • 3D SPATIAL</span>
+        <span class="version">PRO v4.5 • STACK & RIG ENGINE</span>
       </div>
 
       <div class="scrollable-config">
+        <!-- NEW: FLOWN VS GROUND-STACK SUPPORT TOGGLE + EXCEL HARDWARE BREAKDOWN -->
         <div class="config-section">
-          <h3>Client Visuals & Logo</h3>
-          <div class="field"><label>Upload Logo / Screen Content</label><input type="file" accept="image/*" @change="handleLogoUpload" class="file-input"></div>
-          <div class="field color-field" style="margin-top: 10px;"><label style="margin-bottom: 0;">Screen BG Color</label><input type="color" v-model="logoBgColor" class="color-picker"></div>
-          <div class="field" style="margin-top: 10px;"><label>Custom Overlay Text (Optional)</label><input type="text" v-model="pitchOverlayText" placeholder="e.g. Total: $2,500 / day"></div>
-        </div>
+          <h3>Support System (Flown vs Stack)</h3>
+          <div class="toggle-group mb-2">
+            <button :class="{active: supportType === 'ground'}" @click="supportType = 'ground'; set3DCameraView('rear')">🏗️ Ground Stack</button>
+            <button :class="{active: supportType === 'flown'}" @click="supportType = 'flown'; set3DCameraView('front')">⛓️ Flown Rig</button>
+          </div>
 
-        <div class="config-section">
-          <h3>3D Stage & Rigging</h3>
-          <div class="field">
+          <!-- Live Excel Rigging & Ballast Breakdown Card -->
+          <div v-if="supportType === 'ground'" class="hw-breakdown">
+            <div class="hw-row"><span>Brackets (4.8kg):</span><strong>{{ stats.bracket_qty }} ({{ stats.bracket_weight_kg }}kg)</strong></div>
+            <div class="hw-row"><span>850mm Base Legs:</span><strong>{{ stats.base_leg_qty }} ({{ stats.base_leg_weight_kg }}kg)</strong></div>
+            <div class="hw-row"><span>1m Ladder Truss:</span><strong>{{ stats.ladder_truss_qty }} ({{ stats.ladder_truss_weight_kg }}kg)</strong></div>
+            <div class="hw-row"><span>Locking Couplers:</span><strong>{{ stats.beam_coupler_qty }} ({{ stats.beam_coupler_weight_kg }}kg)</strong></div>
+            <div class="hw-row"><span>500mm Cross Bars:</span><strong>{{ stats.crossbar_qty }} ({{ stats.crossbar_weight_kg }}kg)</strong></div>
+            <div class="hw-row sub"><span>Stack Weight (No Ballast):</span><strong>{{ stats.total_ground_stack_weight }} kg</strong></div>
+            <div class="hw-row ballast"><span>Req. Ballast Weight:</span><strong>{{ stats.ballast_weight_kg }} kg</strong></div>
+            <div class="hw-row total"><span>Total w/ Ballast:</span><strong>{{ stats.total_ground_with_ballast }} kg</strong></div>
+          </div>
+
+          <div v-else class="hw-breakdown">
+            <div class="hw-row"><span>Hanging Brackets:</span><strong>{{ stats.bracket_qty }} ({{ stats.bracket_weight_kg }}kg)</strong></div>
+            <div class="hw-row"><span>Halfcoupler & Shackle:</span><strong>{{ stats.halfcoupler_shackle_qty }} ({{ stats.halfcoupler_shackle_weight_kg }}kg)</strong></div>
+            <div class="hw-row"><span>Cable Allowance:</span><strong>{{ stats.cable_weight_kg }} kg</strong></div>
+            <div class="hw-row total"><span>Total Flown Weight:</span><strong>{{ stats.total_flown_weight }} kg</strong></div>
+          </div>
+
+          <div class="field" style="margin-top: 10px;">
             <label>Inter-Column Curve ({{ curveAngle > 0 ? '+' : '' }}{{ curveAngle }}°)</label>
             <input type="range" v-model.number="curveAngle" min="-10" max="10" step="0.5">
           </div>
-          <div class="field">
-            <label>Rigging Trim Height ({{ trimHeight.toFixed(1) }}m)</label>
-            <input type="range" v-model.number="trimHeight" min="0" max="4" step="0.2">
+          <div v-if="supportType === 'flown'" class="field">
+            <label>Flown Trim Height ({{ trimHeight.toFixed(1) }}m)</label>
+            <input type="range" v-model.number="trimHeight" min="0.2" max="5" step="0.2">
           </div>
           <div class="toggle-group" style="margin-top: 6px;">
             <button @click="applyIslandPreset('full')">Solid</button>
@@ -892,23 +1096,16 @@ const generatePixelMap = () => {
         <div class="config-section">
           <h3>Wall Size (Tiles)</h3>
           <div class="input-group">
-            <div class="field"><label>Width</label><input type="number" v-model.number="panel.wall_width_tiles" min="1" max="32"></div>
-            <div class="field"><label>Height</label><input type="number" v-model.number="panel.wall_height_tiles" min="1" max="16"></div>
+            <div class="field"><label>Width</label><input type="number" v-model.number="panel.wall_width_tiles" min="1" max="40"></div>
+            <div class="field"><label>Height</label><input type="number" v-model.number="panel.wall_height_tiles" min="1" max="20"></div>
           </div>
         </div>
 
         <div class="config-section">
-          <h3>Physical Panel Size (mm)</h3>
-          <div class="input-group">
-            <div class="field"><label>Width (mm)</label><input type="number" v-model.number="panel.width_mm" step="10"></div>
-            <div class="field"><label>Height (mm)</label><input type="number" v-model.number="panel.height_mm" step="10"></div>
-          </div>
-        </div>
-
-        <div class="config-section">
-          <h3>Patching Limits</h3>
-          <div class="field"><label>Max per Power Circuit (10A)</label><input type="number" v-model.number="panel.max_power_circuit" min="1"></div>
-          <div class="field"><label>Max per Data Port</label><input type="number" v-model.number="panel.max_data_port" min="1"></div>
+          <h3>Client Visuals & Logo</h3>
+          <div class="field"><label>Upload Logo / Screen Content</label><input type="file" accept="image/*" @change="handleLogoUpload" class="file-input"></div>
+          <div class="field color-field" style="margin-top: 10px;"><label style="margin-bottom: 0;">Screen BG Color</label><input type="color" v-model="logoBgColor" class="color-picker"></div>
+          <div class="field" style="margin-top: 10px;"><label>Custom Overlay Text (Optional)</label><input type="text" v-model="pitchOverlayText" placeholder="e.g. Total: $2,500 / day"></div>
         </div>
 
         <div class="config-section">
@@ -935,9 +1132,19 @@ const generatePixelMap = () => {
         </div>
 
         <div class="config-section">
+          <h3>Patching Limits</h3>
+          <div class="field"><label>Max per Power Circuit (10A)</label><input type="number" v-model.number="panel.max_power_circuit" min="1"></div>
+          <div class="field"><label>Max per Data Port</label><input type="number" v-model.number="panel.max_data_port" min="1"></div>
+        </div>
+
+        <div class="config-section">
           <h3>Panel Specs</h3>
           <input v-model="panel.manufacturer" placeholder="Manufacturer" class="mb-2">
           <input v-model="panel.model" placeholder="Model" class="mb-2">
+          <div class="input-group mb-2">
+            <div class="field"><label>Width (mm)</label><input type="number" v-model.number="panel.width_mm" step="10"></div>
+            <div class="field"><label>Height (mm)</label><input type="number" v-model.number="panel.height_mm" step="10"></div>
+          </div>
           <div class="input-group">
             <div class="field"><label>Pitch (mm)</label><input type="number" v-model.number="panel.pitch" step="0.1"></div>
             <div class="field"><label>Weight (kg)</label><input type="number" v-model.number="panel.weight_kg" step="0.1"></div>
@@ -945,12 +1152,14 @@ const generatePixelMap = () => {
         </div>
 
         <div class="config-section">
-          <h3>Cable Requirements</h3>
+          <h3>Cabling, Power & Spares</h3>
           <div class="cable-stats">
-            <div class="c-stat"><span class="label">Pwr Inputs:</span> <span class="val">{{ stats.power_input_cables }}</span></div>
-            <div class="c-stat"><span class="label">Data Inputs:</span> <span class="val">{{ stats.data_input_cables }}</span></div>
+            <div class="c-stat"><span class="label">10A Outlets:</span> <span class="val">{{ stats.power_input_cables }} ({{ stats.three_phase_distros }}×3Ø)</span></div>
+            <div class="c-stat"><span class="label">Data Ports:</span> <span class="val">{{ stats.data_input_cables }}</span></div>
             <div class="c-stat"><span class="label">Pwr Links:</span> <span class="val">{{ stats.power_link_cables }}</span></div>
             <div class="c-stat"><span class="label">Data Links:</span> <span class="val">{{ stats.data_link_cables }}</span></div>
+            <div class="c-stat"><span class="label">VX1000 Proc:</span> <span class="val">{{ stats.vx1000_processors }}</span></div>
+            <div class="c-stat"><span class="label">Spare Panels:</span> <span class="val">{{ stats.spare_panels }}</span></div>
           </div>
         </div>
       </div>
@@ -972,22 +1181,31 @@ const generatePixelMap = () => {
 
     <div class="main-content">
       <div class="stats-bar">
-        <div class="stat"><span class="label">Active Tiles</span><span class="val">{{ stats.total_tiles }}</span></div>
+        <div class="stat"><span class="label">Active Tiles</span><span class="val">{{ stats.total_tiles }} <small style="font-size:0.7rem;color:#888;">(+{{ stats.spare_panels }} sp)</small></span></div>
         <div class="stat"><span class="label">Physical Size</span><span class="val">{{ stats.width_m }}m × {{ stats.height_m }}m</span></div>
-        <div class="stat"><span class="label">Resolution</span><span class="val highlight">{{ stats.res_w }} × {{ stats.res_h }}</span></div>
-        <div class="stat"><span class="label">Total Weight</span><span class="val">{{ stats.total_weight }} kg</span></div>
-        <div class="stat circuit-stat"><span class="label">Circuits</span><span class="val">{{ stats.total_power_circuits }}</span></div>
-        <div class="stat data-stat"><span class="label">Ports</span><span class="val">{{ stats.total_data_ports }}</span></div>
+        <div class="stat">
+          <span class="label">Resolution</span>
+          <span class="val highlight">
+            {{ stats.res_w }} × {{ stats.res_h }}
+            <span v-if="stats.td_warning_w || stats.td_warning_h" class="td-alert" title="Exceeds UHD 3840x2160 single raster limit">! Check With TD !</span>
+          </span>
+        </div>
+        <div class="stat">
+          <span class="label">{{ supportType === 'ground' ? 'Ground Stack (w/ Ballast)' : 'Total Flown Weight' }}</span>
+          <span class="val">{{ stats.total_weight }} kg</span>
+        </div>
+        <div class="stat circuit-stat"><span class="label">Power ({{ stats.total_amps }}A)</span><span class="val">{{ stats.total_power_circuits }} × 10A</span></div>
+        <div class="stat data-stat"><span class="label">Ports ({{ stats.vx1000_processors }}× VX1000)</span><span class="val">{{ stats.total_data_ports }}</span></div>
       </div>
 
       <div class="viz-toolbar">
-        <div style="display:flex; align-items:center; gap:12px;">
+        <div style="display:flex; align-items:center; gap:10px;">
           <span class="viz-title">
-            {{ viewMode === '3d' ? '3D Spatial Stage Pre-Vis (Click any cabinet to toggle Island)' : viewMode === 'visualizer' ? '2D Client Stage Concept' : 'Schematic Patch View (Click tile to toggle Island)' }}
+            {{ viewMode === '3d' ? `3D ${supportType === 'ground' ? 'Ground-Stack' : 'Flown'} Pre-Vis` : viewMode === 'visualizer' ? '2D Client Stage Concept' : 'Schematic Patch View' }}
           </span>
           <template v-if="viewMode === '3d'">
             <button class="cam-btn" @click="set3DCameraView('front')">Front FOH</button>
-            <button class="cam-btn" @click="set3DCameraView('rear')">Rear Patch</button>
+            <button class="cam-btn" @click="set3DCameraView('rear')">Rear Truss & Patch</button>
             <button class="cam-btn" @click="showScaleHuman3D = !showScaleHuman3D">{{ showScaleHuman3D ? '👷 Hide Tech' : '👷 Show Tech' }}</button>
           </template>
         </div>
@@ -1058,44 +1276,53 @@ const generatePixelMap = () => {
 .login-btn { width: 100%; background: var(--primary); color: white; border: none; padding: 8px; border-radius: 4px; font-weight: bold; cursor: pointer; }
 .logout-btn { background: transparent; border: 1px solid var(--border); color: var(--text-muted); font-size: 0.7rem; padding: 4px 8px; border-radius: 4px; cursor: pointer; }
 
-/* SIDEBAR & CONFIG CSS */
-.sidebar { width: 320px; background-color: var(--bg-panel); border-right: 1px solid var(--border); padding: 20px; display: flex; flex-direction: column; gap: 16px; flex-shrink: 0; z-index: 10; }
+/* SIDEBAR & HARDWARE BREAKDOWN CSS */
+.sidebar { width: 330px; background-color: var(--bg-panel); border-right: 1px solid var(--border); padding: 18px; display: flex; flex-direction: column; gap: 14px; flex-shrink: 0; z-index: 10; }
 .logo-area .header-row { display: flex; justify-content: space-between; align-items: center; }
 .logo-area h2 { margin: 0; font-size: 1.2rem; letter-spacing: 1px; color: var(--text-main); }
-.version { font-size: 0.7rem; color: #29b6f6; font-weight: 700; letter-spacing: 0.5px; }
+.version { font-size: 0.7rem; color: #a3e635; font-weight: 700; letter-spacing: 0.5px; }
 .theme-toggle { background: none; border: 1px solid var(--border); color: var(--text-main); cursor: pointer; border-radius: 4px; padding: 4px 8px; }
-.scrollable-config { overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 18px; padding-right: 5px; }
-.config-section h3 { font-size: 0.8rem; text-transform: uppercase; color: var(--text-muted); margin-bottom: 10px; font-weight: 600; border-bottom: 1px solid var(--border); padding-bottom: 5px; }
+.scrollable-config { overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 16px; padding-right: 5px; }
+.config-section h3 { font-size: 0.78rem; text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px; font-weight: 600; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+
+.hw-breakdown { background: var(--bg-input); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-size: 0.74rem; display: flex; flex-direction: column; gap: 4px; font-family: monospace; }
+.hw-row { display: flex; justify-content: space-between; color: var(--text-muted); }
+.hw-row strong { color: var(--text-main); }
+.hw-row.sub { border-top: 1px dashed var(--border); padding-top: 4px; margin-top: 2px; }
+.hw-row.ballast strong { color: #ffb74d; }
+.hw-row.total { border-top: 1px solid var(--border); padding-top: 4px; font-size: 0.8rem; }
+.hw-row.total strong { color: #a3e635; }
 
 .input-group { display: flex; gap: 10px; } .field { flex: 1; margin-bottom: 5px; } .field label { display: block; font-size: 0.75rem; color: var(--text-muted); margin-bottom: 4px; }
-input { width: 100%; background: var(--bg-input) !important; border: 1px solid var(--border); color: var(--text-input) !important; padding: 8px 10px; border-radius: 4px; font-family: monospace; font-size: 0.9rem; box-sizing: border-box; }
+input { width: 100%; background: var(--bg-input) !important; border: 1px solid var(--border); color: var(--text-input) !important; padding: 7px 10px; border-radius: 4px; font-family: monospace; font-size: 0.88rem; box-sizing: border-box; }
 input[type="range"] { padding: 2px 0; cursor: pointer; }
 input:focus { outline: none; border-color: var(--primary); }
-input[type="file"] { font-family: inherit; font-size: 0.8rem; padding: 5px; cursor: pointer; }
-.mb-2 { margin-bottom: 10px; }
+input[type="file"] { font-family: inherit; font-size: 0.78rem; padding: 5px; cursor: pointer; }
+.mb-2 { margin-bottom: 8px; }
 
 .toggle-group { display: flex; gap: 5px; background: var(--bg-input); padding: 3px; border-radius: 6px; }
-.toggle-group button { flex: 1; background: transparent; border: none; color: var(--text-muted); padding: 6px; font-size: 0.78rem; cursor: pointer; border-radius: 4px; transition: 0.2s; }
+.toggle-group button { flex: 1; background: transparent; border: none; color: var(--text-muted); padding: 6px; font-size: 0.76rem; cursor: pointer; border-radius: 4px; transition: 0.2s; }
 .toggle-group button.active { background: var(--border); color: var(--text-main); font-weight: bold; }
 
-.cable-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 0.8rem; }
-.cable-stats .c-stat { display: flex; flex-direction: column; background: var(--bg-input); padding: 8px; border-radius: 4px; border: 1px solid var(--border); }
-.cable-stats .label { color: var(--text-muted); font-size: 0.7rem; text-transform: uppercase; }
-.cable-stats .val { color: var(--text-main); font-weight: bold; font-size: 1rem; }
+.cable-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-size: 0.75rem; }
+.cable-stats .c-stat { display: flex; flex-direction: column; background: var(--bg-input); padding: 6px 8px; border-radius: 4px; border: 1px solid var(--border); }
+.cable-stats .label { color: var(--text-muted); font-size: 0.65rem; text-transform: uppercase; }
+.cable-stats .val { color: var(--text-main); font-weight: bold; font-size: 0.9rem; }
 
-/* MAIN VIEWPORT & TOOLBAR */
+/* MAIN VIEWPORT & STATS BAR */
 .main-content { flex: 1; display: flex; flex-direction: column; background: var(--bg-app); min-width: 0; }
-.stats-bar { display: flex; background: var(--bg-panel); border-bottom: 1px solid var(--border); padding: 15px 30px; gap: 40px; overflow-x: auto; flex-shrink: 0; }
+.stats-bar { display: flex; background: var(--bg-panel); border-bottom: 1px solid var(--border); padding: 12px 24px; gap: 32px; overflow-x: auto; flex-shrink: 0; }
 .stat { display: flex; flex-direction: column; white-space: nowrap; }
-.stat .label { font-size: 0.7rem; text-transform: uppercase; color: var(--text-muted); font-weight: 600; }
-.stat .val { font-size: 1.1rem; color: var(--text-main); font-weight: 500; margin-top: 2px; }
+.stat .label { font-size: 0.68rem; text-transform: uppercase; color: var(--text-muted); font-weight: 600; }
+.stat .val { font-size: 1.05rem; color: var(--text-main); font-weight: 600; margin-top: 2px; display: flex; align-items: center; gap: 6px; }
 .stat .highlight { color: var(--primary); } .circuit-stat .val { color: #81c784; } .data-stat .val { color: #ef5350; }
+.td-alert { background: #d50000; color: #fff; font-size: 0.65rem; font-weight: 800; padding: 2px 6px; border-radius: 3px; letter-spacing: 0.5px; }
 
-.viz-toolbar { padding: 10px 30px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); background: var(--bg-panel); flex-shrink: 0; }
+.viz-toolbar { padding: 10px 24px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); background: var(--bg-panel); flex-shrink: 0; }
 .viz-title { color: var(--text-muted); font-size: 0.85rem; }
 .cam-btn { background: var(--bg-input); border: 1px solid var(--border); color: var(--text-main); font-size: 0.75rem; padding: 4px 10px; border-radius: 4px; cursor: pointer; }
 .cam-btn:hover { border-color: var(--primary); }
-.view-toggles button { background: var(--bg-input); border: 1px solid var(--border); color: var(--text-muted); padding: 6px 15px; cursor: pointer; }
+.view-toggles button { background: var(--bg-input); border: 1px solid var(--border); color: var(--text-muted); padding: 6px 14px; cursor: pointer; }
 .view-toggles button.active { background: var(--border); color: var(--text-main); font-weight: 600; }
 
 .canvas-wrapper { flex: 1; display: flex; padding: 20px; background: var(--bg-canvas); overflow: hidden; min-height: 0; }
@@ -1123,14 +1350,14 @@ input[type="file"] { font-family: inherit; font-size: 0.8rem; padding: 5px; curs
 .tile-id { z-index: 2; } .arrow { font-size: 1.2em; opacity: 0.85; margin-top: -2px; }
 
 /* EXPORT BUTTONS */
-.export-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: auto; }
-.btn { padding: 10px; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; text-align: center; font-size: 0.8rem; transition: opacity 0.2s; }
+.export-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: auto; }
+.btn { padding: 9px; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; text-align: center; font-size: 0.78rem; transition: opacity 0.2s; }
 .btn:disabled { opacity: 0.3; cursor: not-allowed; filter: grayscale(1); }
 .primary { background: var(--primary); color: white; }
 .secondary { background: #ef5350; color: white; }
 .tertiary { background: #ba68c8; color: white; }
 .outline { background: transparent; border: 1px solid var(--border); color: var(--text-muted); }
 .outline:hover:not(:disabled) { background: var(--border); }
-.highlight-btn { background: linear-gradient(135deg, #ba68c8, #7e57c2); color: white; grid-column: span 2; padding: 14px; font-size: 0.9rem; }
+.highlight-btn { background: linear-gradient(135deg, #ba68c8, #7e57c2); color: white; grid-column: span 2; padding: 12px; font-size: 0.88rem; }
 .highlight-btn:hover:not(:disabled) { filter: brightness(1.2); }
 </style>
